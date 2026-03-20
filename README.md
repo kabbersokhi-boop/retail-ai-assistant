@@ -1,8 +1,6 @@
 # Retail AI Assistant
-
-A CLI-based agentic AI system simulating a **Personal Shopper** and **Customer Support Assistant** for a retail fashion store.
-
-Built with OpenAI function calling - the model dynamically decides which tools to call. No hardcoded responses.
+CLI agent for a retail fashion store. Handles product recommendations and return requests using OpenAI function calling. 
+Tools are called dynamically based on context, no hardcoded logic.
 
 ---
 
