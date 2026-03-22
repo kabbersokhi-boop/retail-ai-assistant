@@ -19,7 +19,15 @@ pip install -r requirements.txt
 
 ### 3. Set your OpenAI API key
 ```bash
+
+**Linux / macOS**
 export OPENAI_API_KEY=your_openai_api_key_here
+
+**Windows (Command Prompt)**
+set OPENAI_API_KEY=your_openai_api_key_here
+
+**Windows (PowerShell)**
+$env:OPENAI_API_KEY="your_openai_api_key_here"
 ```
 
 ### 4. Run the assistant
