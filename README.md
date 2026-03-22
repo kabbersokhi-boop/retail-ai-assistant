@@ -81,3 +81,4 @@ The model calls these tools dynamically - it never hardcodes answers.
 
 - Python 3.9+
 - OpenAI API key (GPT-4o-mini)
+- **Note:** SIMULATION_DATE is set to 2026-02-10 to match the provided order data (Jan 17 – Feb 24 2026). Swap SIMULATION_DATE = date.today()in agent.py for live data.
