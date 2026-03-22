@@ -35,7 +35,7 @@ Just type naturally. The agent handles both shopping and support:
 
 **Personal Shopper:**
 ```
-You: I need a modest evening gown under $300 in size 8, preferably on sale
+You: Find me a lace bridal dress under $400 in size 10
 ```
 
 **Customer Support:**
