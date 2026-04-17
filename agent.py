@@ -8,6 +8,7 @@ import os
 import csv
 import ast
 import json
+import logging
 from datetime import datetime, date
 from typing import Optional
 from openai import OpenAI
@@ -20,70 +21,137 @@ from rich.rule import Rule
 from rich.prompt import Prompt
 from rich.markdown import Markdown
 
-# ── setup ─────────────────────────────────────────────────────────────────────
+# ── constants ────────────────────────────────────────────────────────────
+
+DEFAULT_LIMIT = 5
+MIN_STOCK_DEFAULT = 1
+SIMULATION_DATE = date(2026, 2, 10)  # Fixed date for simulation; change to date.today() for live data
+
+# ── setup ────────────────────────────────────────────────────────────
 
 console = Console()
-
-# Simulation date — fixed so return windows work correctly relative to
-# order dates in orders.csv (Jan 17 – Feb 24 2026).
-# Swap to date.today() when running against live order data.
-SIMULATION_DATE = date(2026, 2, 10)
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# ── data loading ──────────────────────────────────────────────────────────────
-
+# ── data loading ──────────────────────────────────────────────────────────
 def load_products() -> dict:
+    """
+    Load product inventory from CSV file.
+    
+    Returns:
+        dict: Dictionary of products keyed by product_id.
+    
+    Raises:
+        SystemExit: If the file is missing or malformed.
+    """
     products = {}
     path = os.path.join(DATA_DIR, "product_inventory.csv")
     if not os.path.exists(path):
-        console.print(f"[red]Missing file: {path}\nPlease ensure product_inventory.csv is in the same folder as agent.py[/red]")
+        error_msg = f"Missing file: {path}\nPlease ensure product_inventory.csv is in the same folder as agent.py"
+        console.print(f"[red]{error_msg}[/red]")
+        logger.error(error_msg)
         exit(1)
-    with open(path, newline="") as f:
-        for row in csv.DictReader(f):
-            row["price"]             = float(row["price"])
-            row["compare_at_price"]  = float(row["compare_at_price"])
-            row["bestseller_score"]  = int(row["bestseller_score"])
-            row["is_sale"]           = row["is_sale"].strip().lower() == "true"
-            row["is_clearance"]      = row["is_clearance"].strip().lower() == "true"
-            row["sizes_available"]   = [s.strip() for s in row["sizes_available"].split("|")]
-            row["stock_per_size"]    = ast.literal_eval(row["stock_per_size"])
-            row["tags"]              = [t.strip().lower() for t in row["tags"].split(",")]
-            products[row["product_id"]] = row
+    try:
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                row["price"]             = float(row["price"])
+                row["compare_at_price"]  = float(row["compare_at_price"])
+                row["bestseller_score"]  = int(row["bestseller_score"])
+                row["is_sale"]           = row["is_sale"].strip().lower() == "true"
+                row["is_clearance"]      = row["is_clearance"].strip().lower() == "true"
+                row["sizes_available"]   = [s.strip() for s in row["sizes_available"].split("|")]
+                row["stock_per_size"]    = ast.literal_eval(row["stock_per_size"])
+                row["tags"]              = [t.strip().lower() for t in row["tags"].split(",")]
+                products[row["product_id"]] = row
+    except (ValueError, KeyError) as e:
+        error_msg = f"Error parsing product_inventory.csv: {e}"
+        console.print(f"[red]{error_msg}[/red]")
+        logger.error(error_msg)
+        exit(1)
+    logger.info(f"Loaded {len(products)} products from {path}")
     return products
 
 def load_orders() -> dict:
+    """
+    Load order data from CSV file.
+    
+    Returns:
+        dict: Dictionary of orders keyed by order_id.
+    
+    Raises:
+        SystemExit: If the file is missing or malformed.
+    """
     orders = {}
     path = os.path.join(DATA_DIR, "orders.csv")
     if not os.path.exists(path):
-        console.print(f"[red]Missing file: {path}\nPlease ensure orders.csv is in the same folder as agent.py[/red]")
+        error_msg = f"Missing file: {path}\nPlease ensure orders.csv is in the same folder as agent.py"
+        console.print(f"[red]{error_msg}[/red]")
+        logger.error(error_msg)
         exit(1)
-    with open(path, newline="") as f:
-        for row in csv.DictReader(f):
-            row["price_paid"] = float(row["price_paid"])
-            orders[row["order_id"]] = row
+    try:
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                row["price_paid"] = float(row["price_paid"])
+                orders[row["order_id"]] = row
+    except (ValueError, KeyError) as e:
+        error_msg = f"Error parsing orders.csv: {e}"
+        console.print(f"[red]{error_msg}[/red]")
+        logger.error(error_msg)
+        exit(1)
+    logger.info(f"Loaded {len(orders)} orders from {path}")
     return orders
 
 def load_policy() -> str:
-    with open(os.path.join(DATA_DIR, "policy.txt")) as f:
-        return f.read()
+    """
+    Load the store return policy from text file.
+    
+    Returns:
+        str: The policy text.
+    
+    Raises:
+        SystemExit: If the file is missing.
+    """
+    path = os.path.join(DATA_DIR, "policy.txt")
+    try:
+        with open(path) as f:
+            return f.read()
+    except FileNotFoundError:
+        error_msg = f"Missing file: {path}\nPlease ensure policy.txt is in the same folder as agent.py"
+        console.print(f"[red]{error_msg}[/red]")
+        logger.error(error_msg)
+        exit(1)
 
 PRODUCTS = load_products()
 ORDERS   = load_orders()
 POLICY   = load_policy()
 
-# ── tools ─────────────────────────────────────────────────────────────────────
-
+# ── tools ────────────────────────────────────────────────────────────
 def search_products(
-    tags: Optional[list] = None,
-    max_price: Optional[float] = None,
-    size: Optional[str] = None,
-    is_sale: Optional[bool] = None,
-    is_clearance: Optional[bool] = None,
-    min_stock: int = 1,
-    limit: int = 5
+tags: Optional[list] = None,
+max_price: Optional[float] = None,
+size: Optional[str] = None,
+is_sale: Optional[bool] = None,
+is_clearance: Optional[bool] = None,
+min_stock: int = MIN_STOCK_DEFAULT,
+limit: int = DEFAULT_LIMIT
 ) -> list:
-    """Filter products by constraints and return ranked results."""
+    """
+    Filter products by constraints and return ranked results.
+    
+    Args:
+        tags: List of style tags to match.
+        max_price: Maximum price in USD.
+        size: Clothing size.
+        is_sale: Filter sale items only if True.
+        is_clearance: Exclude clearance items if False.
+        min_stock: Minimum stock units required.
+        limit: Max number of results.
+    
+    Returns:
+        list: Ranked list of matching products.
+    """
     results = []
     size_str = str(size) if size else None
 
@@ -114,21 +182,41 @@ def search_products(
     results.sort(key=lambda x: (not x["is_sale"], -x["bestseller_score"]))
     return results[:limit]
 
-
 def get_product(product_id: str) -> Optional[dict]:
-    """Return full product details or None if not found."""
+    """
+    Retrieve full details of a single product.
+    
+    Args:
+        product_id: The product ID.
+    
+    Returns:
+        dict or None: Product details or None if not found.
+    """
     return PRODUCTS.get(product_id)
 
 
 def get_order(order_id: str) -> Optional[dict]:
-    """Return order details or None if not found."""
+    """
+    Retrieve order details by order ID.
+    
+    Args:
+        order_id: The order ID.
+    
+    Returns:
+        dict or None: Order details or None if not found.
+    """
     return ORDERS.get(order_id)
 
 
 def evaluate_return(order_id: str) -> dict:
     """
     Apply policy rules to determine return eligibility.
-    Returns a dict with: eligible (bool), verdict (str), reason (str), policy_applied (str)
+    
+    Args:
+        order_id: The order ID to evaluate.
+    
+    Returns:
+        dict: Evaluation result with eligibility, verdict, reason, and policy applied.
     """
     order = get_order(order_id)
     if not order:
@@ -157,7 +245,7 @@ def evaluate_return(order_id: str) -> dict:
     is_sale = product["is_sale"]
     is_clr  = product["is_clearance"]
 
-    # ── policy rules ──────────────────────────────────────────────────────────
+    # ── policy rules ────────────────────────────────────────────────────────
 
     # Rule 1: Clearance — always final sale
     if is_clr:
@@ -285,7 +373,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "evaluate_return",
-            "description": "Evaluate whether an order is eligible for return based on store policy. Always use this for any return or refund question — never reason about returns without calling this tool.",
+            "description": "Evaluate whether an order is eligible for return based on store policy. Always use this for any return or refund question — never reason about returns without calling this function.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -297,9 +385,18 @@ TOOLS = [
     }
 ]
 
-# ── tool dispatcher ────────────────────────────────────────────────────────────
-
+# ── tool dispatcher ────────────────────────────────────────────────────────
 def dispatch_tool(name: str, args: dict) -> str:
+    """
+    Dispatch tool calls to the appropriate functions.
+    
+    Args:
+        name: Tool name.
+        args: Arguments for the tool.
+    
+    Returns:
+        str: JSON result of the tool call.
+    """
     if name == "search_products":
         results = search_products(**args)
         if not results:
@@ -325,13 +422,12 @@ def dispatch_tool(name: str, args: dict) -> str:
     return json.dumps({"error": f"Unknown tool: {name}"})
 
 # ── rich display helpers ───────────────────────────────────────────────────────
-
 def print_welcome():
     console.print()
     console.print(Panel.fit(
         "[bold white]Retail AI Assistant[/bold white]\n"
         "[dim]Personal Shopper  ·  Customer Support[/dim]\n"
-        "[dim]Type your message or 'exit' to quit[/dim]",
+        "[dim]Type your message or 'exit' to quit[/dim]", 
         border_style="bright_blue",
         padding=(1, 4)
     ))
@@ -342,6 +438,7 @@ def print_user(msg: str):
 
 def print_thinking():
     console.print("[dim italic]  thinking...[/dim italic]")
+
 
 def print_tool_call(name: str, args: dict):
     console.print(f"  [dim]⚙  calling [yellow]{name}[/yellow]({', '.join(f'{k}={v}' for k,v in args.items())})[/dim]")
@@ -361,8 +458,7 @@ def print_error(msg: str):
 def print_rule():
     console.print(Rule(style="dim"))
 
-# ── system prompt ─────────────────────────────────────────────────────────────
-
+# ── system prompt ─────────────────────────────────────────────────────────
 SYSTEM_PROMPT = f"""You are a Retail AI Assistant with two roles:
 
 1. PERSONAL SHOPPER — Help customers find the perfect product.
@@ -389,9 +485,11 @@ STORE RETURN POLICY (for context only — always use evaluate_return() for decis
 Respond in a warm, professional tone. Be concise but justify your reasoning clearly.
 """
 
-# ── agent loop ────────────────────────────────────────────────────────────────
-
+# ── agent loop ──────────────────────────────────────────────────────────
 def run_agent():
+    """
+    Run the main agent loop, handling user input and tool calls.
+    """
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         print_error("OPENAI_API_KEY environment variable not set.\nRun: export OPENAI_API_KEY=your_key_here")
@@ -421,12 +519,19 @@ def run_agent():
 
         # agentic loop — keep calling until no more tool calls
         while True:
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",  # gpt-4o-mini for speed/cost efficiency; swap to gpt-4o for maximum reasoning depth
-                messages=messages,
-                tools=TOOLS,
-                tool_choice="auto"
-            )
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-4o-mini",  # gpt-4o-mini for speed/cost efficiency; swap to gpt-4o for maximum reasoning depth
+                    messages=messages,
+                    tools=TOOLS,
+                    tool_choice="auto"
+                )
+            except Exception as e:
+                error_msg = f"Error calling OpenAI API: {e}"
+                console.print(f"[red]{error_msg}[/red]")
+                logger.error(error_msg)
+                print_rule()
+                break
 
             msg = response.choices[0].message
 
@@ -454,7 +559,6 @@ def run_agent():
 
         print_rule()
 
-# ── entry point ───────────────────────────────────────────────────────────────
-
+# ── entry point ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
     run_agent()
