@@ -8,6 +8,7 @@ import os
 import csv
 import ast
 import json
+import logging
 from datetime import datetime, date
 from typing import Optional
 from openai import OpenAI
@@ -23,54 +24,97 @@ from rich.markdown import Markdown
 # ── setup ─────────────────────────────────────────────────────────────────────
 
 console = Console()
+LOGGER = logging.getLogger("retail_ai_assistant")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s"
+)
 
 # Simulation date — fixed so return windows work correctly relative to
 # order dates in orders.csv (Jan 17 – Feb 24 2026).
 # Swap to date.today() when running against live order data.
 SIMULATION_DATE = date(2026, 2, 10)
+DEFAULT_MIN_STOCK = 1
+DEFAULT_SEARCH_LIMIT = 5
+NOCTURNE_RETURN_WINDOW_DAYS = 21
+SALE_RETURN_WINDOW_DAYS = 7
+STANDARD_RETURN_WINDOW_DAYS = 14
+OPENAI_MODEL = "gpt-4o-mini"
 
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── data loading ──────────────────────────────────────────────────────────────
 
+def log_event(level: str, event: str, **context) -> None:
+    """Write structured log entries for key runtime events."""
+    payload = {"event": event, **context}
+    LOGGER.log(getattr(logging, level.upper(), logging.INFO), json.dumps(payload, default=str))
+
+
 def load_products() -> dict:
+    """Load and normalize product inventory rows from CSV."""
     products = {}
     path = os.path.join(DATA_DIR, "product_inventory.csv")
     if not os.path.exists(path):
         console.print(f"[red]Missing file: {path}\nPlease ensure product_inventory.csv is in the same folder as agent.py[/red]")
-        exit(1)
-    with open(path, newline="") as f:
-        for row in csv.DictReader(f):
-            row["price"]             = float(row["price"])
-            row["compare_at_price"]  = float(row["compare_at_price"])
-            row["bestseller_score"]  = int(row["bestseller_score"])
-            row["is_sale"]           = row["is_sale"].strip().lower() == "true"
-            row["is_clearance"]      = row["is_clearance"].strip().lower() == "true"
-            row["sizes_available"]   = [s.strip() for s in row["sizes_available"].split("|")]
-            row["stock_per_size"]    = ast.literal_eval(row["stock_per_size"])
-            row["tags"]              = [t.strip().lower() for t in row["tags"].split(",")]
-            products[row["product_id"]] = row
+        raise SystemExit(1)
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            for row_num, row in enumerate(csv.DictReader(f), start=2):
+                try:
+                    row["price"] = float(row["price"])
+                    row["compare_at_price"] = float(row["compare_at_price"])
+                    row["bestseller_score"] = int(row["bestseller_score"])
+                    row["is_sale"] = row["is_sale"].strip().lower() == "true"
+                    row["is_clearance"] = row["is_clearance"].strip().lower() == "true"
+                    row["sizes_available"] = [s.strip() for s in row["sizes_available"].split("|")]
+                    row["stock_per_size"] = ast.literal_eval(row["stock_per_size"])
+                    row["tags"] = [t.strip().lower() for t in row["tags"].split(",")]
+                    products[row["product_id"]] = row
+                except (KeyError, ValueError, SyntaxError) as exc:
+                    raise ValueError(f"Invalid product row {row_num}: {exc}") from exc
+    except (OSError, csv.Error, ValueError) as exc:
+        log_event("error", "load_products_failed", path=path, error=str(exc))
+        console.print(f"[red]Failed to parse product_inventory.csv: {exc}[/red]")
+        raise SystemExit(1)
     return products
 
 def load_orders() -> dict:
+    """Load and normalize order rows from CSV."""
     orders = {}
     path = os.path.join(DATA_DIR, "orders.csv")
     if not os.path.exists(path):
         console.print(f"[red]Missing file: {path}\nPlease ensure orders.csv is in the same folder as agent.py[/red]")
-        exit(1)
-    with open(path, newline="") as f:
-        for row in csv.DictReader(f):
-            row["price_paid"] = float(row["price_paid"])
-            orders[row["order_id"]] = row
+        raise SystemExit(1)
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            for row_num, row in enumerate(csv.DictReader(f), start=2):
+                try:
+                    row["price_paid"] = float(row["price_paid"])
+                    orders[row["order_id"]] = row
+                except (KeyError, ValueError) as exc:
+                    raise ValueError(f"Invalid order row {row_num}: {exc}") from exc
+    except (OSError, csv.Error, ValueError) as exc:
+        log_event("error", "load_orders_failed", path=path, error=str(exc))
+        console.print(f"[red]Failed to parse orders.csv: {exc}[/red]")
+        raise SystemExit(1)
     return orders
 
 def load_policy() -> str:
-    with open(os.path.join(DATA_DIR, "policy.txt")) as f:
-        return f.read()
+    """Load the return-policy text used in the system prompt."""
+    path = os.path.join(DATA_DIR, "policy.txt")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError as exc:
+        log_event("error", "load_policy_failed", path=path, error=str(exc))
+        console.print(f"[red]Failed to load policy.txt: {exc}[/red]")
+        raise SystemExit(1)
 
 PRODUCTS = load_products()
 ORDERS   = load_orders()
 POLICY   = load_policy()
+log_event("info", "data_loaded", products=len(PRODUCTS), orders=len(ORDERS))
 
 # ── tools ─────────────────────────────────────────────────────────────────────
 
@@ -80,10 +124,23 @@ def search_products(
     size: Optional[str] = None,
     is_sale: Optional[bool] = None,
     is_clearance: Optional[bool] = None,
-    min_stock: int = 1,
-    limit: int = 5
+    min_stock: int = DEFAULT_MIN_STOCK,
+    limit: int = DEFAULT_SEARCH_LIMIT
 ) -> list:
-    """Filter products by constraints and return ranked results."""
+    """Filter products and return ranked matches.
+
+    Args:
+        tags: Optional list of desired product tags.
+        max_price: Optional maximum price in USD.
+        size: Optional requested size string.
+        is_sale: Optional sale filter.
+        is_clearance: Optional clearance filter.
+        min_stock: Minimum stock required for the requested size.
+        limit: Maximum number of products to return.
+
+    Returns:
+        A ranked list of product dictionaries.
+    """
     results = []
     size_str = str(size) if size else None
 
@@ -127,8 +184,13 @@ def get_order(order_id: str) -> Optional[dict]:
 
 def evaluate_return(order_id: str) -> dict:
     """
-    Apply policy rules to determine return eligibility.
-    Returns a dict with: eligible (bool), verdict (str), reason (str), policy_applied (str)
+    Evaluate return eligibility for an order according to store policy.
+
+    Args:
+        order_id: The order identifier to evaluate.
+
+    Returns:
+        A dictionary with fields: eligible, verdict, reason, and policy_applied.
     """
     order = get_order(order_id)
     if not order:
@@ -179,56 +241,56 @@ def evaluate_return(order_id: str) -> dict:
 
     # Rule 3: Nocturne — extended 21-day window
     if vendor == "nocturne":
-        window = 21
+        window = NOCTURNE_RETURN_WINDOW_DAYS
         if days_since <= window:
             refund_type = "store credit only" if is_sale else "full refund"
             return {
                 "eligible": True,
                 "verdict": "ELIGIBLE",
-                "reason": f"Nocturne has an extended 21-day return window. Order placed {days_since} days ago. Eligible for {refund_type}.",
-                "policy_applied": "Vendor Exception — Nocturne: Extended return window of 21 days."
+                "reason": f"Nocturne has an extended {window}-day return window. Order placed {days_since} days ago. Eligible for {refund_type}.",
+                "policy_applied": f"Vendor Exception — Nocturne: Extended return window of {window} days."
             }
         else:
             return {
                 "eligible": False,
                 "verdict": "NOT ELIGIBLE",
-                "reason": f"Nocturne's extended 21-day return window has passed. Order placed {days_since} days ago.",
-                "policy_applied": "Vendor Exception — Nocturne: Extended return window of 21 days."
+                "reason": f"Nocturne's extended {window}-day return window has passed. Order placed {days_since} days ago.",
+                "policy_applied": f"Vendor Exception — Nocturne: Extended return window of {window} days."
             }
 
     # Rule 4: Sale items — 7 days, store credit only
     if is_sale:
-        window = 7
+        window = SALE_RETURN_WINDOW_DAYS
         if days_since <= window:
             return {
                 "eligible": True,
                 "verdict": "ELIGIBLE — STORE CREDIT ONLY",
-                "reason": f"Sale item returned within {days_since} days (within 7-day window). Store credit only — no cash refund.",
-                "policy_applied": "Sale Items: Returnable within 7 days. Store credit only."
+                "reason": f"Sale item returned within {days_since} days (within {window}-day window). Store credit only — no cash refund.",
+                "policy_applied": f"Sale Items: Returnable within {window} days. Store credit only."
             }
         else:
             return {
                 "eligible": False,
                 "verdict": "NOT ELIGIBLE",
-                "reason": f"Sale item return window is 7 days. Order placed {days_since} days ago — window has passed.",
-                "policy_applied": "Sale Items: Returnable within 7 days. Store credit only."
+                "reason": f"Sale item return window is {window} days. Order placed {days_since} days ago — window has passed.",
+                "policy_applied": f"Sale Items: Returnable within {window} days. Store credit only."
             }
 
     # Rule 5: Normal items — 14 days, full refund
-    window = 14
+    window = STANDARD_RETURN_WINDOW_DAYS
     if days_since <= window:
         return {
             "eligible": True,
             "verdict": "ELIGIBLE — FULL REFUND",
-            "reason": f"Normal item returned within {days_since} days (within 14-day window). Eligible for full refund.",
-            "policy_applied": "Normal Items: Returns accepted within 14 days for a full refund."
+            "reason": f"Normal item returned within {days_since} days (within {window}-day window). Eligible for full refund.",
+            "policy_applied": f"Normal Items: Returns accepted within {window} days for a full refund."
         }
     else:
         return {
             "eligible": False,
             "verdict": "NOT ELIGIBLE",
-            "reason": f"Normal item return window is 14 days. Order placed {days_since} days ago — window has passed.",
-            "policy_applied": "Normal Items: Returns accepted within 14 days for a full refund."
+            "reason": f"Normal item return window is {window} days. Order placed {days_since} days ago — window has passed.",
+            "policy_applied": f"Normal Items: Returns accepted within {window} days for a full refund."
         }
 
 # ── tool definitions for OpenAI ───────────────────────────────────────────────
@@ -300,6 +362,8 @@ TOOLS = [
 # ── tool dispatcher ────────────────────────────────────────────────────────────
 
 def dispatch_tool(name: str, args: dict) -> str:
+    """Dispatch tool calls from the model and return JSON-encoded results."""
+    log_event("info", "tool_dispatch_start", tool=name, args=args)
     if name == "search_products":
         results = search_products(**args)
         if not results:
@@ -322,6 +386,7 @@ def dispatch_tool(name: str, args: dict) -> str:
         result = evaluate_return(args["order_id"])
         return json.dumps(result)
 
+    log_event("warning", "unknown_tool", tool=name)
     return json.dumps({"error": f"Unknown tool: {name}"})
 
 # ── rich display helpers ───────────────────────────────────────────────────────
@@ -392,6 +457,7 @@ Respond in a warm, professional tone. Be concise but justify your reasoning clea
 # ── agent loop ────────────────────────────────────────────────────────────────
 
 def run_agent():
+    """Run the interactive assistant loop with OpenAI tool-calling."""
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         print_error("OPENAI_API_KEY environment variable not set.\nRun: export OPENAI_API_KEY=your_key_here")
@@ -399,6 +465,7 @@ def run_agent():
 
     client = OpenAI(api_key=api_key)
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    log_event("info", "agent_started")
 
     print_welcome()
 
@@ -421,12 +488,17 @@ def run_agent():
 
         # agentic loop — keep calling until no more tool calls
         while True:
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",  # gpt-4o-mini for speed/cost efficiency; swap to gpt-4o for maximum reasoning depth
-                messages=messages,
-                tools=TOOLS,
-                tool_choice="auto"
-            )
+            try:
+                response = client.chat.completions.create(
+                    model=OPENAI_MODEL,  # swap to gpt-4o for maximum reasoning depth
+                    messages=messages,
+                    tools=TOOLS,
+                    tool_choice="auto"
+                )
+            except Exception as exc:
+                log_event("error", "openai_chat_completion_failed", error=str(exc))
+                print_error("I ran into an issue contacting the AI service. Please try again.")
+                break
 
             msg = response.choices[0].message
 
@@ -441,7 +513,24 @@ def run_agent():
 
             for tc in msg.tool_calls:
                 name = tc.function.name
-                args = json.loads(tc.function.arguments)
+                try:
+                    args = json.loads(tc.function.arguments)
+                except json.JSONDecodeError as exc:
+                    log_event("error", "tool_argument_parse_failed", tool=name, arguments=tc.function.arguments, error=str(exc))
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": json.dumps({"error": f"Unable to parse arguments for tool '{name}'."})
+                    })
+                    continue
+                if not isinstance(args, dict):
+                    log_event("error", "tool_argument_invalid_type", tool=name, arg_type=type(args).__name__)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": json.dumps({"error": f"Arguments for tool '{name}' must be an object."})
+                    })
+                    continue
                 print_tool_call(name, args)
 
                 result = dispatch_tool(name, args)
